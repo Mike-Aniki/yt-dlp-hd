@@ -5,7 +5,7 @@ A lightweight wrapper around yt-dlp to enforce high resolution (up to 4K) downlo
 Recent YouTube 4K videos are often delivered using AV1 or VP9 codecs, which may not play correctly in Playnite due to Windows Media Foundation limitations.
 This fork adds a user-friendly compatibility mode and optional smart H.264 auto-conversion.
 
-## What This Version Adds
+## What This fork Version Adds
 
 - Optional H.264-only compatibility mode
 - Automatic detection of video codec
@@ -58,7 +58,7 @@ New: Compatibility Mode
 
 ### Re-Encode Quality Settings
 
-Only used when always_compatible=false and the downloaded video is not already H.264.
+Only used when ``always_compatible=false`` and the downloaded video is not already H.264.
 
 - x264_preset
 Encoding speed/compression balance.
@@ -86,7 +86,7 @@ debug=false
 always_compatible=false
 
 x264_preset=fast
-x264_crf=18
+x264_crf=20
 audio_bitrate=192k
 ```
 
