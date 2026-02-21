@@ -19,7 +19,6 @@ func logLine(line string) {
 	}
 	exPath, err := os.Executable()
 	if err != nil {
-		// can't call logLine safely here (it depends on debugMode + file path)
 		os.Exit(1)
 	}
 	exDir := filepath.Dir(exPath)
@@ -31,17 +30,27 @@ func logLine(line string) {
 }
 
 func readINI() map[string]string {
-	// Backward compatible defaults (original INI keys still work)
 	config := map[string]string{
 		"maxres":            "best",
 		"yt-dlp-path":       "",
 		"ffmpeg-path":       "",
-		"debug":             "true",  // default to true if not provided
-		"always_compatible": "false", // user-friendly: false = best quality + auto-convert if needed
+		"debug":             "true",
+		"always_compatible": "false",
 
-		// Only used when always_compatible=false AND codec isn't already H.264
-		"x264_preset":   "fast",
-		"x264_crf":      "18",
+		// New options
+		"output_codec": "h264", // h264 | h265
+		"encoder":      "auto", // auto | cpu | nvenc
+
+		// CPU settings
+		"x264_preset": "fast",
+		"x264_crf":    "18",
+		"x265_preset": "fast",
+		"x265_crf":    "22",
+
+		// NVENC settings
+		"nvenc_preset": "p5",
+		"nvenc_cq":     "19",
+
 		"audio_bitrate": "192k",
 	}
 
@@ -55,7 +64,6 @@ func readINI() map[string]string {
 	data, err := ioutil.ReadFile(filepath.Join(exDir, "yt-dlp.ini"))
 	if err != nil {
 		logLine("INI not found, using default settings")
-		// Apply debug switch from defaults
 		if strings.ToLower(config["debug"]) == "false" {
 			debugMode = false
 		}
@@ -79,7 +87,6 @@ func readINI() map[string]string {
 	return config
 }
 
-// Best quality (may pick AV1/VP9 in 4K)
 func buildBestFormatString(maxres string) string {
 	switch strings.ToLower(maxres) {
 	case "480p":
@@ -112,27 +119,18 @@ func buildH264OnlyFormatString(maxres string) string {
 }
 
 func resolveOutputPath(args []string) string {
-	// Try to resolve -o output template to an actual mp4 path.
-	// Works best with simple templates, especially the wrapper's own "VideoTemp.%(ext)s" style.
 	for i := 0; i < len(args)-1; i++ {
 		if args[i] == "-o" {
 			out := args[i+1]
-
-			// If it uses %(ext)s, replace with mp4
 			if strings.Contains(out, "%(ext)") {
 				out = strings.ReplaceAll(out, "%(ext)s", "mp4")
 			}
-
-			// If it still contains other tokens, we can't reliably resolve
 			if strings.Contains(out, "%(") {
 				return ""
 			}
-
-			// If it's a directory-only output, can't resolve
 			if strings.HasSuffix(out, string(os.PathSeparator)) {
 				return ""
 			}
-
 			abs, err := filepath.Abs(out)
 			if err == nil {
 				return abs
@@ -158,23 +156,132 @@ func ffprobeCodec(ffprobeExe, filePath string) (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("ffprobe failed: %v (%s)", err, out.String())
 	}
-	return strings.TrimSpace(out.String()), nil // "h264", "av1", "vp9", ...
+	return strings.TrimSpace(out.String()), nil
 }
 
-func reencodeToH264(ffmpegExe, inPath, preset, crf, audioBitrate string) error {
-	tmpPath := inPath + ".tmp.mp4"
+func ffmpegHasEncoder(ffmpegExe, encoderName string) bool {
+	// Check if ffmpeg lists an encoder (e.g., h264_nvenc, hevc_nvenc)
+	cmd := exec.Command(ffmpegExe, "-hide_banner", "-encoders")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		logLine("ffmpeg -encoders failed: " + err.Error())
+		return false
+	}
+	return strings.Contains(out.String(), encoderName)
+}
 
-	args := []string{
-		"-y",
-		"-i", inPath,
+func normalizeOutputCodec(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "h265", "hevc":
+		return "h265"
+	default:
+		return "h264"
+	}
+}
+
+func normalizeEncoderMode(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "cpu":
+		return "cpu"
+	case "nvenc":
+		return "nvenc"
+	default:
+		return "auto"
+	}
+}
+
+func targetCodecName(outputCodec string) string {
+	// Compare against ffprobe codec_name values
+	if outputCodec == "h265" {
+		return "hevc"
+	}
+	return "h264"
+}
+
+func buildFfmpegReencodeArgs(config map[string]string, outputCodec, encoderMode string, ffmpegExe string) (string, []string) {
+	// Returns: chosen encoder label for logging + ffmpeg arguments (excluding -y -i input and output file)
+	audioBitrate := config["audio_bitrate"]
+
+	outputCodec = normalizeOutputCodec(outputCodec)
+	encoderMode = normalizeEncoderMode(encoderMode)
+
+	// Decide actual encoder (auto => nvenc if available else cpu)
+	useNvenc := false
+	if encoderMode == "nvenc" {
+		useNvenc = true
+	} else if encoderMode == "auto" {
+		if outputCodec == "h264" && ffmpegHasEncoder(ffmpegExe, "h264_nvenc") {
+			useNvenc = true
+		}
+		if outputCodec == "h265" && ffmpegHasEncoder(ffmpegExe, "hevc_nvenc") {
+			useNvenc = true
+		}
+	}
+
+	if useNvenc {
+		nvPreset := config["nvenc_preset"]
+		nvCQ := config["nvenc_cq"]
+
+		if outputCodec == "h265" {
+			return "hevc_nvenc", []string{
+				"-c:v", "hevc_nvenc",
+				"-preset", nvPreset,
+				"-cq", nvCQ,
+				"-c:a", "aac",
+				"-b:a", audioBitrate,
+				"-movflags", "+faststart",
+			}
+		}
+
+		return "h264_nvenc", []string{
+			"-c:v", "h264_nvenc",
+			"-preset", nvPreset,
+			"-cq", nvCQ,
+			"-c:a", "aac",
+			"-b:a", audioBitrate,
+			"-movflags", "+faststart",
+		}
+	}
+
+	// CPU path
+	if outputCodec == "h265" {
+		preset := config["x265_preset"]
+		crf := config["x265_crf"]
+		return "libx265", []string{
+			"-c:v", "libx265",
+			"-preset", preset,
+			"-crf", crf,
+			"-c:a", "aac",
+			"-b:a", audioBitrate,
+			"-movflags", "+faststart",
+		}
+	}
+
+	preset := config["x264_preset"]
+	crf := config["x264_crf"]
+	return "libx264", []string{
 		"-c:v", "libx264",
 		"-preset", preset,
 		"-crf", crf,
 		"-c:a", "aac",
 		"-b:a", audioBitrate,
 		"-movflags", "+faststart",
-		tmpPath,
 	}
+}
+
+func reencode(ffmpegExe, inPath, encoderLabel string, ffmpegArgs []string) error {
+	tmpPath := inPath + ".tmp.mp4"
+
+	args := []string{"-y", "-i", inPath}
+	args = append(args, ffmpegArgs...)
+	args = append(args, tmpPath)
+
+	logLine("FFmpeg encoder: " + encoderLabel)
+	logLine("FFmpeg args: " + strings.Join(args, " "))
 
 	cmd := exec.Command(ffmpegExe, args...)
 	cmd.Stdout = os.Stdout
@@ -184,7 +291,6 @@ func reencodeToH264(ffmpegExe, inPath, preset, crf, audioBitrate string) error {
 		return err
 	}
 
-	// Replace original file with the converted one
 	if err := os.Remove(inPath); err != nil {
 		return err
 	}
@@ -197,16 +303,27 @@ func main() {
 
 	maxres := config["maxres"]
 	alwaysCompatible := strings.ToLower(config["always_compatible"]) == "true"
+	outputCodec := normalizeOutputCodec(config["output_codec"])
+	encoderMode := normalizeEncoderMode(config["encoder"])
 
 	ytDlpPath := filepath.Join(config["yt-dlp-path"], "yt-dlp.exe")
-	ffmpegDir := config["ffmpeg-path"] // expected to be the folder containing ffmpeg.exe (+ ffprobe.exe)
+	ffmpegDir := config["ffmpeg-path"]
 
 	logLine("Original args: " + strings.Join(args, " "))
-	logLine(fmt.Sprintf("Config: maxres=%s always_compatible=%v", maxres, alwaysCompatible))
+	logLine(fmt.Sprintf("Config: maxres=%s always_compatible=%v output_codec=%s encoder=%s",
+		maxres, alwaysCompatible, outputCodec, encoderMode))
 
+	if outputCodec == "h265" {
+		logLine("Note: H.265/HEVC playback may require Windows HEVC support. H.264 is recommended for maximum compatibility.")
+	}
+
+	// always_compatible means "download H.264 only" (best Playnite compatibility)
 	var format string
 	if alwaysCompatible {
 		format = buildH264OnlyFormatString(maxres)
+		if outputCodec != "h264" {
+			logLine("always_compatible=true forces H.264 download for compatibility (ignoring output_codec=h265).")
+		}
 	} else {
 		format = buildBestFormatString(maxres)
 	}
@@ -214,7 +331,6 @@ func main() {
 	var finalArgs []string
 	skipNext := false
 
-	// Clean up incoming args from caller (Playnite/EML)
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 
@@ -223,7 +339,6 @@ func main() {
 			continue
 		}
 
-		// Remove "-f mp4" if the caller forces it (we provide our own -f)
 		if arg == "-f" && i+1 < len(args) && args[i+1] == "mp4" {
 			logLine("Stripped -f mp4")
 			skipNext = true
@@ -233,10 +348,8 @@ func main() {
 		finalArgs = append(finalArgs, arg)
 	}
 
-	// Add corrected format
 	finalArgs = append(finalArgs, "-f", format)
 
-	// Add ffmpeg location and merge format (still produce mp4)
 	if ffmpegDir != "" {
 		finalArgs = append(finalArgs, "--ffmpeg-location", ffmpegDir)
 		logLine("Set ffmpeg path: " + ffmpegDir)
@@ -248,15 +361,11 @@ func main() {
 	for i := 0; i < len(finalArgs)-1; i++ {
 		if finalArgs[i] == "-o" {
 			out := finalArgs[i+1]
-
-			// If it does not contain a template token...
 			if !strings.Contains(out, "%(") {
-				// If it ends in .mp4, strip it (we'll reattach via template)
 				if strings.HasSuffix(strings.ToLower(out), ".mp4") {
 					out = strings.TrimSuffix(out, ".mp4")
 					logLine("Stripped .mp4 extension from output path")
 				}
-				// Append .%(ext)s template
 				out += ".%(ext)s"
 				finalArgs[i+1] = out
 				logLine("Adjusted output to: " + out)
@@ -266,56 +375,53 @@ func main() {
 
 	logLine("Final yt-dlp args: " + strings.Join(finalArgs, " "))
 
-	// Run yt-dlp (real binary)
 	cmd := exec.Command(ytDlpPath, finalArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Dir, _ = filepath.Abs(".")
-	err := cmd.Run()
-	if err != nil {
+	if err := cmd.Run(); err != nil {
 		logLine("Error running yt-dlp: " + err.Error())
 		os.Exit(1)
 	}
 
-	// If user wants best quality, auto-convert ONLY when needed
-	if !alwaysCompatible && ffmpegDir != "" {
-		outPath := resolveOutputPath(finalArgs)
-		if outPath == "" {
-			logLine("Could not resolve output path from -o; skipping codec check/re-encode.")
-			return
-		}
-
-		// Only proceed if file exists
-		if _, statErr := os.Stat(outPath); statErr != nil {
-			logLine("Output file not found for codec check: " + outPath + " (" + statErr.Error() + ")")
-			return
-		}
-
-		ffprobeExe := filepath.Join(ffmpegDir, "ffprobe.exe")
-		ffmpegExe := filepath.Join(ffmpegDir, "ffmpeg.exe")
-
-		codec, probeErr := ffprobeCodec(ffprobeExe, outPath)
-		if probeErr != nil {
-			logLine("ffprobe error: " + probeErr.Error())
-			return
-		}
-
-		logLine("Detected video codec: " + codec)
-
-		if strings.ToLower(codec) == "h264" {
-			logLine("Already H.264, skipping re-encode.")
-			return
-		}
-
-		preset := config["x264_preset"]
-		crf := config["x264_crf"]
-		abr := config["audio_bitrate"]
-
-		logLine(fmt.Sprintf("Re-encoding to H.264 (preset=%s crf=%s audio=%s)...", preset, crf, abr))
-		if encErr := reencodeToH264(ffmpegExe, outPath, preset, crf, abr); encErr != nil {
-			logLine("Re-encode error: " + encErr.Error())
-			os.Exit(1)
-		}
-		logLine("Re-encode done.")
+	// Smart re-encode only when needed (only when always_compatible=false)
+	if alwaysCompatible || ffmpegDir == "" {
+		return
 	}
+
+	outPath := resolveOutputPath(finalArgs)
+	if outPath == "" {
+		logLine("Could not resolve output path from -o; skipping codec check/re-encode.")
+		return
+	}
+
+	if _, statErr := os.Stat(outPath); statErr != nil {
+		logLine("Output file not found for codec check: " + outPath + " (" + statErr.Error() + ")")
+		return
+	}
+
+	ffprobeExe := filepath.Join(ffmpegDir, "ffprobe.exe")
+	ffmpegExe := filepath.Join(ffmpegDir, "ffmpeg.exe")
+
+	codec, probeErr := ffprobeCodec(ffprobeExe, outPath)
+	if probeErr != nil {
+		logLine("ffprobe error: " + probeErr.Error())
+		return
+	}
+	logLine("Detected video codec: " + codec)
+
+	target := targetCodecName(outputCodec)
+	if strings.ToLower(codec) == target {
+		logLine("Already " + strings.ToUpper(target) + ", skipping re-encode.")
+		return
+	}
+
+	encoderLabel, ffArgs := buildFfmpegReencodeArgs(config, outputCodec, encoderMode, ffmpegExe)
+	logLine(fmt.Sprintf("Re-encoding to %s using %s...", strings.ToUpper(target), encoderLabel))
+
+	if encErr := reencode(ffmpegExe, outPath, encoderLabel, ffArgs); encErr != nil {
+		logLine("Re-encode error: " + encErr.Error())
+		os.Exit(1)
+	}
+	logLine("Re-encode done.")
 }
