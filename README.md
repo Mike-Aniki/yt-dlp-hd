@@ -8,7 +8,7 @@ A lightweight wrapper around yt-dlp to enforce high resolution (up to 4K) downlo
 
 Recent YouTube 4K videos are often delivered using AV1 or VP9 codecs, which may not play correctly in Playnite due to Windows Media Foundation limitations.
 
-This fork adds a user-friendly compatibility mode and optional smart H.264 auto-conversion.
+This fork adds a user-friendly compatibility mode and optional smart H.264 or H.265 auto-conversion.
 
 ## What This fork Version Adds
 
