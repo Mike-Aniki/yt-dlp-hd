@@ -1,6 +1,6 @@
 <div align="center">
 
-# Youtube Download HD
+# Playnite Trailer Downloader HD
 ![Made for Playnite](https://img.shields.io/badge/Made%20for-Playnite%20Community-7C3AED?style=for-the-badge)
 </div>
 
